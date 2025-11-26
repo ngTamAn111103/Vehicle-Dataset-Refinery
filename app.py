@@ -25,12 +25,12 @@ faiss.omp_set_num_threads(1)
 # ------------------------------
 
 # Cấu hình
-TEST = True
-SAMPLE_SIZE = 500
+TEST = False
+SAMPLE_SIZE = 5000
 
 # ___Ngưỡng lọc ảnh___
 # Độ nét
-BLUR_THRESHOLD = 90.0
+BLUR_THRESHOLD = 100.0
 # Độ tối
 DARK_THRESHOLD = 30.0
 # Độ sáng
@@ -39,9 +39,9 @@ BRIGHT_THRESHOLD = 220.0
 THRESHOLD_FAISS = 0.9
 
 # ___Tốc độ___
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 if TEST:
-    WORKERS = 1
+    WORKERS = 4
 else:
     WORKERS = 0
 
@@ -689,8 +689,157 @@ def extract_features(clean_images: List[str]) -> Tuple[np.ndarray, List[str]]:
     print(f"✅ Đã lưu features.npy ({features_matrix.shape}) vào {out_dir}")
     
     return features_matrix, all_paths
+def calculate_detail_score(image_path: str) -> float:
+    """
+    Tính điểm "Độ chi tiết" (Detail Density) bằng thuật toán Canny Edge Detection.
+    
+    Nguyên lý: Đếm số lượng điểm ảnh là cạnh (Edge Pixels). 
+    - Ảnh trơn (sườn xe): Ít cạnh -> Điểm thấp.
+    - Ảnh chi tiết (biển số, lưới tản nhiệt): Nhiều cạnh -> Điểm cao (ví dụ 10.000 - 50.000).
 
+    Args:
+        image_path (str): Đường dẫn file ảnh.
+
+    Returns:
+        float: Số lượng pixel cạnh tìm thấy.
+    """
+    try:
+        # Đọc ảnh xám
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if img is None: return 0.0
+        
+        # Dùng Canny để tìm cạnh
+        # Ngưỡng 100-200 là tiêu chuẩn vàng để lọc nhiễu nhẹ, chỉ lấy nét chính
+        edges = cv2.Canny(img, 100, 200)
+        
+        # Đếm tổng số điểm ảnh là cạnh (pixel màu trắng = 255)
+        # np.count_nonzero đếm số phần tử khác 0
+        score = np.count_nonzero(edges)
+        
+        return float(score)
+    except:
+        return 0.0
+
+    
 def cluster_and_filter_faiss(features: np.ndarray, paths: List[str], duplicate_log: List[Dict]) -> int:
+    print(f"\n✨ [Bước 5] Gom nhóm ảnh trùng bằng FAISS (Threshold={THRESHOLD_FAISS} - Detail Priority)...")
+    
+    # 1. Indexing
+    d = features.shape[1]
+    index = faiss.IndexFlatIP(d)
+    index.add(features)
+    
+    # 2. Range Search
+    print("--> Đang quét vector...")
+    lims, D, I = index.range_search(features, THRESHOLD_FAISS)
+    
+    # 3. Xây dựng đồ thị
+    G = nx.Graph()
+    G.add_nodes_from(range(len(paths)))
+    
+    # Dùng tqdm để theo dõi tiến độ xây graph
+    for i in tqdm(range(len(paths)), desc="Building Graph"):
+        start, end = lims[i], lims[i+1]
+        for j in range(start, end):
+            if i != I[j]:
+                G.add_edge(i, I[j])
+
+    # 4. Xử lý nhóm (Chiến thuật: Detail First, Sharpness Second)
+    components = list(nx.connected_components(G))
+    duplicate_groups = [c for c in components if len(c) > 1]
+    
+    print(f"--> Tìm thấy {len(duplicate_groups)} cụm tiềm năng. Bắt đầu thanh trừng...")
+    
+    deleted_count = 0
+    
+    # Cache để không phải tính đi tính lại (Tính 1 lần dùng nhiều lần)
+    metrics_cache = {} 
+
+    def get_metrics(idx):
+        if idx not in metrics_cache:
+            p = paths[idx]
+            # Tính cả 2 chỉ số: Chi tiết (Canny) & Độ nét (Laplacian)
+            metrics_cache[idx] = {
+                'detail': calculate_detail_score(p),
+                'sharpness': calculate_sharpness(p)
+            }
+        return metrics_cache[idx]
+
+    for component in tqdm(duplicate_groups, desc="AI Filtering"):
+        comp_list = list(component)
+        
+        # --- LOGIC BẦU VUA (KEEPER) MỚI ---
+        
+        # Bước A: Lấy thông tin tất cả ứng viên trong nhóm
+        candidates = []
+        for idx in comp_list:
+            m = get_metrics(idx)
+            candidates.append({
+                'idx': idx,
+                'detail': m['detail'],
+                'sharpness': m['sharpness']
+            })
+        
+        # Bước B: Sắp xếp theo ĐỘ CHI TIẾT giảm dần (Ưu tiên ảnh nhiều thông tin nhất lên đầu)
+        candidates.sort(key=lambda x: x['detail'], reverse=True)
+        
+        # Bước C: Tuyển chọn Keeper
+        # Mặc định chọn thằng nhiều chi tiết nhất (đang đứng đầu danh sách)
+        keeper_candidate = candidates[0] 
+        
+        # Tuy nhiên, nếu thằng chi tiết nhất lại quá mờ (do rung tay), ta xét thằng nhì, thằng ba...
+        # Ngưỡng chấp nhận: 80% của ngưỡng lọc ban đầu (Ví dụ: 90 * 0.8 = 72)
+        min_sharpness_required = BLUR_THRESHOLD * 0.8
+        
+        for cand in candidates:
+            if cand['sharpness'] >= min_sharpness_required:
+                keeper_candidate = cand
+                break # Tìm thấy người xứng đáng (Chi tiết cao + Đủ nét) -> Chốt luôn!
+        
+        # Gán Keeper chính thức
+        keeper_idx = keeper_candidate['idx']
+        keeper_vec = features[keeper_idx]
+        keeper_path = paths[keeper_idx]
+        
+        # Lưu điểm Detail vào log để biết tại sao nó được chọn (Số này sẽ rất lớn, vd: 15000)
+        keeper_score_log = keeper_candidate['detail'] 
+        
+        # --- LOGIC XÓA (SO GĂNG TRỰC TIẾP) ---
+        # Lấy danh sách các ID cần xóa (Tất cả trừ Keeper)
+        duplicates_idx = [x['idx'] for x in candidates if x['idx'] != keeper_idx]
+        
+        for del_idx in duplicates_idx:
+            # Kiểm tra lại độ giống nhau trực tiếp để tránh lỗi bắc cầu
+            candidate_vec = features[del_idx]
+            sim = np.dot(keeper_vec, candidate_vec)
+            
+            if sim >= THRESHOLD_FAISS:
+                del_path = paths[del_idx]
+                target_path = os.path.join(OUTPUT_BASE, "similar", os.path.basename(del_path))
+                
+                try:
+                    shutil.move(del_path, target_path)
+                    
+                    sim_percent = f"{sim * 100:.2f}%"
+                    # Lấy điểm detail của thằng bị xóa để so sánh trong báo cáo
+                    del_score_log = get_metrics(del_idx)['detail']
+                    
+                    duplicate_log.append({
+                        'kept_path': keeper_path, 
+                        'kept_name': os.path.basename(keeper_path), 
+                        'kept_score': keeper_score_log, # Điểm Chi tiết (Canny)
+                        'del_path': target_path, 
+                        'del_name': os.path.basename(del_path), 
+                        'del_score': del_score_log,     # Điểm Chi tiết (Canny)
+                        'reason': f"AI: {sim_percent}", 
+                        'del_origin': del_path
+                    })
+                    deleted_count += 1
+                except: pass
+
+    return deleted_count
+
+def cluster_and_filter_faiss_OLD(features: np.ndarray, paths: List[str], duplicate_log: List[Dict]) -> int:
     """
     Phân cụm và lọc ảnh trùng lặp sử dụng AI (FAISS) kết hợp Lý thuyết đồ thị và Kiểm tra trực tiếp.
 
@@ -813,42 +962,14 @@ def cluster_and_filter_faiss(features: np.ndarray, paths: List[str], duplicate_l
 
     return deleted_count
 
-def calculate_detail_score(image_path: str) -> float:
-    """
-    Tính điểm "Độ chi tiết" (Detail Density) bằng thuật toán Canny Edge Detection.
-    
-    Nguyên lý: Đếm số lượng điểm ảnh là cạnh (Edge Pixels). 
-    - Ảnh trơn (sườn xe): Ít cạnh -> Điểm thấp.
-    - Ảnh chi tiết (biển số, lưới tản nhiệt): Nhiều cạnh -> Điểm cao (ví dụ 10.000 - 50.000).
-
-    Args:
-        image_path (str): Đường dẫn file ảnh.
-
-    Returns:
-        float: Số lượng pixel cạnh tìm thấy.
-    """
-    try:
-        # Đọc ảnh xám
-        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-        if img is None: return 0.0
-        
-        # Dùng Canny để tìm cạnh
-        # Ngưỡng 100-200 là tiêu chuẩn vàng để lọc nhiễu nhẹ, chỉ lấy nét chính
-        edges = cv2.Canny(img, 100, 200)
-        
-        # Đếm tổng số điểm ảnh là cạnh (pixel màu trắng = 255)
-        # np.count_nonzero đếm số phần tử khác 0
-        score = np.count_nonzero(edges)
-        
-        return float(score)
-    except:
-        return 0.0
-
+# ================= 8. REPORTING (UI/UX V5 Ultimate) =================
 def generate_html_report(duplicate_log, quality_log, output_file):
-    print("📝 Đang tạo báo cáo HTML (UI/UX Ultimate Version)...")
+    print("📝 Đang tạo báo cáo HTML (V5 - Ultimate UI/UX)...")
 
-    # --- 1. XỬ LÝ DỮ LIỆU ---
+    # --- 1. XỬ LÝ DỮ LIỆU & GOM NHÓM ---
+    # Logic: Tìm ra "Trùm cuối" (Ultimate Keeper) cho chuỗi thay thế A->B->C
     move_map = {entry['del_origin']: entry['kept_path'] for entry in duplicate_log}
+    
     def find_ultimate_keeper(current_path):
         if current_path in move_map: return find_ultimate_keeper(move_map[current_path])
         return current_path
@@ -856,17 +977,32 @@ def generate_html_report(duplicate_log, quality_log, output_file):
     grouped_data = {}
     for entry in duplicate_log:
         final_keeper = find_ultimate_keeper(entry['kept_path'])
+        
         if final_keeper not in grouped_data:
             k_name = os.path.basename(final_keeper)
+            # Lấy score (nếu path đổi thì tính lại, hoặc lấy tạm score cũ)
             k_score = entry['kept_score'] if final_keeper == entry['kept_path'] else calculate_sharpness(final_keeper)
-            grouped_data[final_keeper] = {'kept_info': {'name': k_name, 'path': final_keeper, 'score': k_score}, 'deleted_list': []}
+                
+            grouped_data[final_keeper] = {
+                'kept_info': {'name': k_name, 'path': final_keeper, 'score': k_score}, 
+                'deleted_list': []
+            }
+        
         grouped_data[final_keeper]['deleted_list'].append(entry)
 
-    # Thống kê
+    # Thống kê số liệu
     total_quality = len(quality_log)
-    total_dups = sum(len(g['deleted_list']) for g in grouped_data.values())
-    
-    # --- 2. HTML TEMPLATE ---
+    # Tách số lượng xóa do Hash và do AI để hiển thị dashboard
+    count_hash_del = 0
+    count_ai_del = 0
+    for g in grouped_data.values():
+        for item in g['deleted_list']:
+            if "AI" in item['reason']: count_ai_del += 1
+            else: count_hash_del += 1
+            
+    total_cleaned = total_quality + count_hash_del + count_ai_del
+
+    # --- 2. HTML TEMPLATE & CSS ---
     html_head = """
     <!DOCTYPE html>
     <html lang="vi">
@@ -902,8 +1038,9 @@ def generate_html_report(duplicate_log, quality_log, output_file):
                 position: fixed; top: 0; width: 100%; z-index: 1000;
                 background: rgba(255, 255, 255, 0.8); backdrop-filter: blur(12px);
                 border-bottom: 1px solid rgba(0,0,0,0.05);
-                [data-theme="dark"] & { background: rgba(30, 41, 59, 0.8); border-bottom: 1px solid rgba(255,255,255,0.05); }
             }
+            [data-theme="dark"] .navbar { background: rgba(30, 41, 59, 0.8); border-bottom: 1px solid rgba(255,255,255,0.05); }
+            
             .nav-content {
                 max-width: 1400px; margin: 0 auto; height: 70px; padding: 0 24px;
                 display: flex; justify-content: space-between; align-items: center;
@@ -917,7 +1054,6 @@ def generate_html_report(duplicate_log, quality_log, output_file):
             .nav-item:hover { color: var(--primary); background: rgba(255,255,255,0.5); }
             .nav-item.active { background: var(--card); color: var(--primary); box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
             
-            /* Toggle Theme */
             .theme-toggle {
                 width: 40px; height: 40px; border-radius: 50%; border: none; cursor: pointer;
                 background: rgba(0,0,0,0.05); display: flex; align-items: center; justify-content: center; font-size: 18px;
@@ -983,7 +1119,7 @@ def generate_html_report(duplicate_log, quality_log, output_file):
             /* Deleted Grid */
             .del-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 16px; }
             .del-card { position: relative; border-radius: 12px; overflow: hidden; background: #000; }
-            .del-card img { width: 100%; height: 100px; object-fit: cover; opacity: 0.7; transition: 0.3s; }
+            .del-card img { width: 100%; height: 100px; object-fit: cover; opacity: 0.7; transition: 0.3s; cursor: zoom-in; }
             .del-card:hover img { opacity: 1; }
             .del-info { 
                 position: absolute; bottom: 0; left: 0; width: 100%; padding: 8px;
@@ -1079,15 +1215,11 @@ def generate_html_report(duplicate_log, quality_log, output_file):
     html_quality += "</div></div>"
 
     # --- 4. SECTION: DUPLICATES ---
-    # Tách dữ liệu
     sorted_groups = sorted(grouped_data.values(), key=lambda x: len(x['deleted_list']), reverse=True)
     
     html_hash = '<div id="hashing" class="section"><div class="section-header"><div class="title-group"><h2><i class="fa-solid fa-fingerprint" style="color:var(--success)"></i> Lọc Hashing</h2></div></div>'
     html_ai = '<div id="ai" class="section"><div class="section-header"><div class="title-group"><h2><i class="fa-solid fa-brain" style="color:var(--ai)"></i> Lọc AI Deep Learning</h2></div></div>'
     
-    count_hash_del = 0
-    count_ai_del = 0
-
     for group in sorted_groups:
         kept = group['kept_info']
         deleted = group['deleted_list']
@@ -1095,9 +1227,6 @@ def generate_html_report(duplicate_log, quality_log, output_file):
         hash_dels = [d for d in deleted if "AI" not in d['reason']]
         ai_dels = [d for d in deleted if "AI" in d['reason']]
         
-        count_hash_del += len(hash_dels)
-        count_ai_del += len(ai_dels)
-
         def render_block(dels, type="hash"):
             if not dels: return ""
             cards = ""
@@ -1121,7 +1250,7 @@ def generate_html_report(duplicate_log, quality_log, output_file):
                     <span class="tag" style="background:var(--success-light); color:var(--success); font-size:12px;"><i class="fa-solid fa-check"></i> GIỮ LẠI (BEST)</span>
                     <img class="keeper-preview" src="{kept['path']}" onclick="openModal(this)">
                     <div style="font-weight:700;">{kept['name']}</div>
-                    <div style="color:var(--gray); font-size:12px;">Độ nét: {kept['score']:.1f}</div>
+                    <div style="color:var(--gray); font-size:12px;">Score: {kept['score']:.1f}</div>
                 </div>
                 <div class="comp-deleted">
                     <h4 style="margin-bottom:16px; color:{theme_color}; display:flex; align-items:center; gap:8px;">
@@ -1145,7 +1274,6 @@ def generate_html_report(duplicate_log, quality_log, output_file):
         </div>
         
         <script>
-            // Lazy Load Images
             document.addEventListener("DOMContentLoaded", function() {
                 const observer = new IntersectionObserver((entries) => {
                     entries.forEach(entry => {
@@ -1169,7 +1297,6 @@ def generate_html_report(duplicate_log, quality_log, output_file):
                 body.setAttribute('data-theme', body.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
             }
             
-            // Scroll Spy
             window.onscroll = () => {
                 document.querySelectorAll('.section').forEach(sec => {
                     if(window.scrollY >= (sec.offsetTop - 100)) {
@@ -1187,7 +1314,7 @@ def generate_html_report(duplicate_log, quality_log, output_file):
     final_html = html_head.replace("{qty_bad}", str(total_quality)) \
                           .replace("{hash_dups}", str(count_hash_del)) \
                           .replace("{ai_dups}", str(count_ai_del)) \
-                          .replace("{total_cleaned}", str(total_quality + count_hash_del + count_ai_del)) \
+                          .replace("{total_cleaned}", str(total_cleaned)) \
                + html_quality + html_hash + html_ai + html_end
 
     try:
@@ -1196,6 +1323,7 @@ def generate_html_report(duplicate_log, quality_log, output_file):
         print(f"✅ Đã tạo báo cáo HTML (V5 - Ultimate UI/UX) tại: {output_file}")
     except Exception as e:
         print(f"❌ Lỗi report: {e}")
+
 # ================= HÀM MAIN (ĐIỀU PHỐI CHÍNH) =================
 def main():
     start_time = time.time()
@@ -1239,7 +1367,6 @@ def main():
     
 
     # B5: Tạo báo cáo (Tổng hợp tất cả log)
-    # (Bạn cần copy lại hàm generate_html_report vào code này để chạy dòng dưới)
     generate_html_report(duplicate_log, quality_log, os.path.join(OUTPUT_BASE, REPORT_FILE))
     # Lưu log ra JSON để backup
     log_data = {
