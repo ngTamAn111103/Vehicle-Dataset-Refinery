@@ -1,0 +1,10 @@
+opencv-python 
+tqdm 
+ImageHash 
+cython 
+numpy<2.0
+faiss-cpu 
+fastreid 
+torch 
+torchvision
+networkx
