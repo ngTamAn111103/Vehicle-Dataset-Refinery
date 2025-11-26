@@ -26,22 +26,22 @@ faiss.omp_set_num_threads(1)
 
 # Cấu hình
 TEST = True
-SAMPLE_SIZE = 500
+SAMPLE_SIZE = 5000
 
 # ___Ngưỡng lọc ảnh___
 # Độ nét
 BLUR_THRESHOLD = 90.0
 # Độ tối
-DARK_THRESHOLD = 30.0
+DARK_THRESHOLD = 25.0
 # Độ sáng
 BRIGHT_THRESHOLD = 220.0
 # Ngưỡng giống nhau của Deep Learning
 THRESHOLD_FAISS = 0.9
 
 # ___Tốc độ___
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 if TEST:
-    WORKERS = 1
+    WORKERS = 4
 else:
     WORKERS = 0
 
@@ -691,6 +691,124 @@ def extract_features(clean_images: List[str]) -> Tuple[np.ndarray, List[str]]:
     return features_matrix, all_paths
 
 def cluster_and_filter_faiss(features: np.ndarray, paths: List[str], duplicate_log: List[Dict]) -> int:
+    print(f"\n✨ [Bước 5] Gom nhóm ảnh trùng bằng FAISS (Threshold={THRESHOLD_FAISS} - Detail Priority)...")
+    
+    # 1. Indexing
+    d = features.shape[1]
+    index = faiss.IndexFlatIP(d)
+    index.add(features)
+    
+    # 2. Range Search
+    print("--> Đang quét vector...")
+    lims, D, I = index.range_search(features, THRESHOLD_FAISS)
+    
+    # 3. Xây dựng đồ thị
+    G = nx.Graph()
+    G.add_nodes_from(range(len(paths)))
+    
+    # Dùng tqdm để theo dõi tiến độ xây graph
+    for i in tqdm(range(len(paths)), desc="Building Graph"):
+        start, end = lims[i], lims[i+1]
+        for j in range(start, end):
+            if i != I[j]:
+                G.add_edge(i, I[j])
+
+    # 4. Xử lý nhóm (Chiến thuật: Detail First, Sharpness Second)
+    components = list(nx.connected_components(G))
+    duplicate_groups = [c for c in components if len(c) > 1]
+    
+    print(f"--> Tìm thấy {len(duplicate_groups)} cụm tiềm năng. Bắt đầu thanh trừng...")
+    
+    deleted_count = 0
+    
+    # Cache để không phải tính đi tính lại (Tính 1 lần dùng nhiều lần)
+    metrics_cache = {} 
+
+    def get_metrics(idx):
+        if idx not in metrics_cache:
+            p = paths[idx]
+            # Tính cả 2 chỉ số: Chi tiết (Canny) & Độ nét (Laplacian)
+            metrics_cache[idx] = {
+                'detail': calculate_detail_score(p),
+                'sharpness': calculate_sharpness(p)
+            }
+        return metrics_cache[idx]
+
+    for component in tqdm(duplicate_groups, desc="AI Filtering"):
+        comp_list = list(component)
+        
+        # --- LOGIC BẦU VUA (KEEPER) MỚI ---
+        
+        # Bước A: Lấy thông tin tất cả ứng viên trong nhóm
+        candidates = []
+        for idx in comp_list:
+            m = get_metrics(idx)
+            candidates.append({
+                'idx': idx,
+                'detail': m['detail'],
+                'sharpness': m['sharpness']
+            })
+        
+        # Bước B: Sắp xếp theo ĐỘ CHI TIẾT giảm dần (Ưu tiên ảnh nhiều thông tin nhất lên đầu)
+        candidates.sort(key=lambda x: x['detail'], reverse=True)
+        
+        # Bước C: Tuyển chọn Keeper
+        # Mặc định chọn thằng nhiều chi tiết nhất (đang đứng đầu danh sách)
+        keeper_candidate = candidates[0] 
+        
+        # Tuy nhiên, nếu thằng chi tiết nhất lại quá mờ (do rung tay), ta xét thằng nhì, thằng ba...
+        # Ngưỡng chấp nhận: 80% của ngưỡng lọc ban đầu (Ví dụ: 90 * 0.8 = 72)
+        min_sharpness_required = BLUR_THRESHOLD * 0.8
+        
+        for cand in candidates:
+            if cand['sharpness'] >= min_sharpness_required:
+                keeper_candidate = cand
+                break # Tìm thấy người xứng đáng (Chi tiết cao + Đủ nét) -> Chốt luôn!
+        
+        # Gán Keeper chính thức
+        keeper_idx = keeper_candidate['idx']
+        keeper_vec = features[keeper_idx]
+        keeper_path = paths[keeper_idx]
+        
+        # Lưu điểm Detail vào log để biết tại sao nó được chọn (Số này sẽ rất lớn, vd: 15000)
+        keeper_score_log = keeper_candidate['detail'] 
+        
+        # --- LOGIC XÓA (SO GĂNG TRỰC TIẾP) ---
+        # Lấy danh sách các ID cần xóa (Tất cả trừ Keeper)
+        duplicates_idx = [x['idx'] for x in candidates if x['idx'] != keeper_idx]
+        
+        for del_idx in duplicates_idx:
+            # Kiểm tra lại độ giống nhau trực tiếp để tránh lỗi bắc cầu
+            candidate_vec = features[del_idx]
+            sim = np.dot(keeper_vec, candidate_vec)
+            
+            if sim >= THRESHOLD_FAISS:
+                del_path = paths[del_idx]
+                target_path = os.path.join(OUTPUT_BASE, "similar", os.path.basename(del_path))
+                
+                try:
+                    shutil.move(del_path, target_path)
+                    
+                    sim_percent = f"{sim * 100:.2f}%"
+                    # Lấy điểm detail của thằng bị xóa để so sánh trong báo cáo
+                    del_score_log = get_metrics(del_idx)['detail']
+                    
+                    duplicate_log.append({
+                        'kept_path': keeper_path, 
+                        'kept_name': os.path.basename(keeper_path), 
+                        'kept_score': keeper_score_log, # Điểm Chi tiết (Canny)
+                        'del_path': target_path, 
+                        'del_name': os.path.basename(del_path), 
+                        'del_score': del_score_log,     # Điểm Chi tiết (Canny)
+                        'reason': f"AI: {sim_percent}", 
+                        'del_origin': del_path
+                    })
+                    deleted_count += 1
+                except: pass
+
+    return deleted_count
+
+def cluster_and_filter_faiss_OLD(features: np.ndarray, paths: List[str], duplicate_log: List[Dict]) -> int:
     """
     Phân cụm và lọc ảnh trùng lặp sử dụng AI (FAISS) kết hợp Lý thuyết đồ thị và Kiểm tra trực tiếp.
 
