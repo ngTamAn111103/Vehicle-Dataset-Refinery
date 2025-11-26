@@ -2,8 +2,6 @@
 
 🇺🇸 Hello, I'm An, currently looking for an Intern position after graduation. I hope that if anyone sees this and can, please give me an internship opportunity. Thank you. (@annguyen3528-telegram)
 
-
-ResNet-FAISS-Dedup
 # ResNet-FAISS-Dedup: Semantic Deduplication Pipeline 🚀
 
 *"Biến dữ liệu thô thành vàng ròng"*
